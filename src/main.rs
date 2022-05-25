@@ -5,9 +5,21 @@ use eaip::{eaip::ais::GB, prelude::*};
 #[tokio::main]
 async fn main() {
     let eaip = &*GB;
+    eprint!("Fetching navaids... ");
     let navaids = Navaids::from_current_eaip(eaip).await.unwrap();
+    eprint!("done!\nFetching intersections... ");
     let intersections = Intersections::from_current_eaip(eaip).await.unwrap();
+    eprint!("done!\nFetching airways... ");
     let airways = Airways::from_current_eaip(eaip).await.unwrap();
+    eprint!("done!\nFetching airport list... ");
+    let mut airports = Airports::from_current_eaip(eaip).await.unwrap();
+    for airport in &mut airports {
+        let icao = airport.icao().clone();
+        eprint!("done!\nFetching airport {}... ", icao);
+        *airport = Airport::from_current_eaip(eaip, icao).await.unwrap();
+    }
+
+    eprint!("done!\nBuilding SQL... ");
 
     let mut sql_out = BufWriter::new(File::create("navdata.sql").unwrap());
 
@@ -121,4 +133,58 @@ async fn main() {
             i += 1;
         }
     }
+
+    writeln!(sql_out, "\n\n-- Airports --").unwrap();
+    writeln!(
+        sql_out,
+        "CREATE TABLE IF NOT EXISTS `airport` (
+            `icao` CHAR(4) NOT NULL,
+            `name` VARCHAR(255) NOT NULL,
+            `latitude` DOUBLE NOT NULL,
+            `longitude` DOUBLE NOT NULL,
+            `elevation` INT NOT NULL,
+            PRIMARY KEY (`icao`));"
+    )
+    .unwrap();
+    writeln!(
+        sql_out,
+        "CREATE TABLE IF NOT EXISTS `chart` (
+            `id` INT NOT NULL AUTO_INCREMENT,
+            `airport_icao` CHAR(4) NOT NULL,
+            `title` VARCHAR(128) NOT NULL,
+            `url` TEXT NOT NULL,
+            PRIMARY KEY (`id`),
+            INDEX `fk_chart_airport_idx` (`airport_icao` ASC) VISIBLE,
+            CONSTRAINT `fk_chart_airport`
+              FOREIGN KEY (`airport_icao`)
+              REFERENCES `airport` (`icao`)
+              ON DELETE CASCADE
+              ON UPDATE CASCADE);"
+    )
+    .unwrap();
+
+    for airport in airports {
+        writeln!(
+            sql_out,
+            r#"INSERT INTO `airport` VALUES ("{}", "{}", {}, {}, {});"#,
+            airport.icao(),
+            airport.name(),
+            airport.longitude(),
+            airport.latitude(),
+            airport.elevation(),
+        )
+        .unwrap();
+        for chart in airport.charts() {
+            writeln!(
+                sql_out,
+                r#"INSERT INTO `chart` (`airport_icao`, `title`, `url`) VALUES ("{}", "{}", "{}");"#,
+                airport.icao(),
+                chart.title(),
+                chart.url(),
+            )
+            .unwrap();
+        }
+    }
+
+    eprintln!("done!");
 }

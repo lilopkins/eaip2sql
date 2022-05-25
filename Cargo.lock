@@ -223,6 +223,8 @@ dependencies = [
 [[package]]
 name = "eaip"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7925dfdb03bc8db02006c8e2f1a7e41991ae7dd393e7a75dc5be9e41cf43e8c9"
 dependencies = [
  "airac",
  "async-trait",
@@ -233,6 +235,7 @@ dependencies = [
  "reqwest",
  "scraper 0.13.0",
  "table-extract",
+ "url",
 ]
 
 [[package]]
