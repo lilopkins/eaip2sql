@@ -1,190 +1,273 @@
-use std::{fs::File, io::prelude::*, io::BufWriter};
+use std::sync::Arc;
 
-use eaip::{eaip::ais::GB, prelude::*};
+use airac::AIRAC;
+use anyhow::{Context, Result};
+use chrono::Utc;
+use clap::Parser;
+use eaip::{eaip::ais, prelude::*};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use sqlx::AnyPool;
 
-#[tokio::main]
-async fn main() {
-    let eaip = &*GB;
-    eprint!("Fetching navaids... ");
-    let navaids = Navaids::from_current_eaip(eaip).await.unwrap();
-    eprint!("done!\nFetching intersections... ");
-    let intersections = Intersections::from_current_eaip(eaip).await.unwrap();
-    eprint!("done!\nFetching airways... ");
-    let airways = Airways::from_current_eaip(eaip).await.unwrap();
-    eprint!("done!\nFetching airport list... ");
-    let mut airports = Airports::from_current_eaip(eaip).await.unwrap();
-    for airport in &mut airports {
-        let icao = airport.icao().clone();
-        eprint!("done!\nFetching airport {}... ", icao);
-        *airport = Airport::from_current_eaip(eaip, icao).await.unwrap();
-    }
+#[derive(Parser, Debug)]
+#[clap(author, version, about)]
+struct Args {
+    /// The connection URL for the database. MySQL and SQLite supported.
+    #[clap(short, long, default_value = "sqlite:navdata.db")]
+    database_uri: String,
 
-    eprint!("done!\nBuilding SQL... ");
+    /// Build data for the next AIRAC cycle, instead of the current one.
+    #[clap(short, long)]
+    next_cycle: bool,
 
-    let mut sql_out = BufWriter::new(File::create("navdata.sql").unwrap());
+    /// AIS sources to exclude by two letter country code.
+    #[clap(short = 'x', long)]
+    exclude_ais: Vec<String>,
 
-    writeln!(sql_out, "-- Navaids --").unwrap();
-    writeln!(
-        sql_out,
-        "CREATE TABLE IF NOT EXISTS `navaid` (
-        `id` CHAR(3) NOT NULL,
-        `name` VARCHAR(45) NOT NULL,
-        `frequency` DECIMAL(6,3) NOT NULL,
-        `latitude` DOUBLE NOT NULL,
-        `longitude` DOUBLE NOT NULL,
-        `elevation` INT NOT NULL,
-        `type` SET('VOR', 'DME', 'NDB', 'TACAN') NOT NULL DEFAULT 'VOR,DME',
-        PRIMARY KEY (`id`));"
-    )
-    .unwrap();
+    /// List all available AIS sources.
+    #[clap(short, long)]
+    list_ais: bool,
+}
 
-    // Some duplication occurs when two navaids use the same designator, we only really care about one.
-    let mut designators = Vec::new();
+async fn get_eaip_data(
+    m: &MultiProgress,
+    pb_eaip: &ProgressBar,
+    sty: ProgressStyle,
+    eaip: &EAIP,
+    airac: AIRAC,
+    pool: &AnyPool,
+) -> Result<()> {
+    pb_eaip.set_position(0);
+    pb_eaip.set_message("Fetching navaids... ");
+    let navaids = Navaids::from_eaip(eaip, airac.clone()).await.unwrap();
+    pb_eaip.inc(1);
+
+    pb_eaip.set_message("Storing navaids... ");
+    let mut already_inserted = Vec::new();
     for navaid in navaids {
-        if designators.contains(navaid.id()) {
+        if already_inserted.contains(navaid.id()) {
             continue;
         }
-        designators.push(navaid.id().clone());
-        writeln!(
-            sql_out,
-            r#"INSERT INTO `navaid` VALUES ("{}", "{}", {}, {}, {}, {}, "{}");"#,
-            navaid.id(),
-            navaid.name(),
-            if navaid.kind() == NavAidKind::NDB {
-                navaid.frequency_khz() as f32
-            } else {
-                navaid.frequency()
-            },
-            navaid.latitude(),
-            navaid.longitude(),
-            navaid.elevation(),
-            match navaid.kind() {
+        already_inserted.push(navaid.id().clone());
+
+        pb_eaip.set_message(format!("Storing navaid {}... ", navaid.id()));
+        sqlx::query("INSERT INTO `navaid` (`id`, `name`, `frequency`, `latitude`, `longitude`, `elevation`, `type`) VALUES (?, ?, ?, ?, ?, ?, ?);")
+            .bind(navaid.id())
+            .bind(navaid.name())
+            .bind(if navaid.kind() == NavAidKind::NDB { navaid.frequency_khz() as f32 } else { navaid.frequency() })
+            .bind(navaid.latitude())
+            .bind(navaid.longitude())
+            .bind(navaid.elevation() as i32)
+            .bind(match navaid.kind() {
+                NavAidKind::VOR => "VOR",
                 NavAidKind::DME => "DME",
                 NavAidKind::NDB => "NDB",
-                NavAidKind::VOR => "VOR",
                 NavAidKind::VORDME => "VOR,DME",
-            }
-        )
-        .unwrap();
+            })
+            .execute(pool)
+            .await
+            .with_context(|| format!("Inserting navaid {} to the database.", navaid.id()))?;
     }
+    pb_eaip.inc(1);
 
-    writeln!(sql_out, "\n\n-- Intersections --").unwrap();
-    writeln!(
-        sql_out,
-        "CREATE TABLE IF NOT EXISTS `intersection` (
-        `designator` CHAR(5) NOT NULL,
-        `latitude` DOUBLE NOT NULL,
-        `longitude` DOUBLE NOT NULL,
-        PRIMARY KEY (`designator`));"
-    )
-    .unwrap();
-
+    pb_eaip.set_message("Fetching intersections... ");
+    let intersections = Intersections::from_eaip(eaip, airac.clone()).await.unwrap();
+    pb_eaip.inc(1);
+    pb_eaip.set_message("Storing intersections... ");
     for intersection in intersections {
-        writeln!(
-            sql_out,
-            r#"INSERT INTO `intersection` VALUES ("{}", {}, {});"#,
-            intersection.designator(),
-            intersection.latitude(),
-            intersection.longitude(),
+        pb_eaip.set_message(format!(
+            "Storing intersection {}... ",
+            intersection.designator()
+        ));
+        sqlx::query(
+            "INSERT INTO `intersection` (`designator`, `latitude`, `longitude`) VALUES (?, ?, ?);",
         )
-        .unwrap();
+        .bind(intersection.designator())
+        .bind(intersection.latitude())
+        .bind(intersection.longitude())
+        .execute(pool)
+        .await
+        .with_context(|| {
+            format!(
+                "Inserting intersection {} to the database.",
+                intersection.designator()
+            )
+        })?;
     }
+    pb_eaip.inc(1);
 
-    writeln!(sql_out, "\n\n-- Airways --").unwrap();
-    writeln!(
-        sql_out,
-        "CREATE TABLE IF NOT EXISTS `airway_waypoint` (
-        `airway_designator` VARCHAR(5) NOT NULL,
-        `waypoint_id` INT NOT NULL,
-        `upper_limit` VARCHAR(16) NOT NULL,
-        `lower_limit` VARCHAR(16) NOT NULL,
-        `navaid_id` CHAR(3) NULL,
-        `intersection_designator` CHAR(5) NULL,
-        PRIMARY KEY (`airway_designator`, `waypoint_id`),
-        INDEX `fk_airway_navaid_idx` (`navaid_id` ASC) VISIBLE,
-        INDEX `fk_airway_intersection_idx` (`intersection_designator` ASC) VISIBLE,
-        CONSTRAINT `fk_airway_navaid`
-          FOREIGN KEY (`navaid_id`)
-          REFERENCES `navaid` (`ID`)
-          ON DELETE RESTRICT
-          ON UPDATE RESTRICT,
-        CONSTRAINT `fk_airway_intersection`
-          FOREIGN KEY (`intersection_designator`)
-          REFERENCES `intersection` (`designator`)
-          ON DELETE RESTRICT
-          ON UPDATE RESTRICT);"
-    )
-    .unwrap();
-
+    pb_eaip.set_message("Fetching airways... ");
+    let airways = Airways::from_eaip(eaip, airac.clone()).await.unwrap();
+    pb_eaip.inc(1);
+    pb_eaip.set_message("Storing airways... ");
     for airway in airways {
         let mut i = 1;
+        pb_eaip.set_message(format!("Storing {} airway... ", airway.designator()));
         for waypoint in airway.waypoints() {
-            writeln!(
-                sql_out,
-                r#"INSERT INTO `airway_waypoint` VALUES ("{}", {}, "{}", "{}", {}, {});"#,
-                airway.designator(),
-                i,
-                waypoint.upper_limit().replace("\n", ""),
-                waypoint.lower_limit().replace("\n", ""),
-                if waypoint.is_navaid() { format!(r#""{}""#, waypoint.designator()) } else { "NULL".into() },
-                if waypoint.is_intersection() { format!(r#""{}""#, waypoint.designator()) } else { "NULL".into() }
+            sqlx::query(
+                "INSERT INTO `airway_waypoint` (`airway_designator`, `waypoint_id`, `upper_limit`, `lower_limit`, `navaid_id`, `intersection_designator`) VALUES (?, ?, ?, ?, ?, ?);",
             )
-            .unwrap();
+            .bind(airway.designator())
+            .bind(i)
+            .bind(waypoint.upper_limit())
+            .bind(waypoint.lower_limit())
+            .bind(if waypoint.is_navaid() { Some(waypoint.designator()) } else { None })
+            .bind(if waypoint.is_intersection() { Some(waypoint.designator()) } else { None })
+            .execute(pool)
+            .await
+            .with_context(|| {
+                format!(
+                    "Inserting airway {} waypoint {} to the database.",
+                    airway.designator(),
+                    waypoint.designator(),
+                )
+            })?;
             i += 1;
         }
     }
+    pb_eaip.inc(1);
 
-    writeln!(sql_out, "\n\n-- Airports --").unwrap();
-    writeln!(
-        sql_out,
-        "CREATE TABLE IF NOT EXISTS `airport` (
-            `icao` CHAR(4) NOT NULL,
-            `name` VARCHAR(255) NOT NULL,
-            `latitude` DOUBLE NOT NULL,
-            `longitude` DOUBLE NOT NULL,
-            `elevation` INT NOT NULL,
-            PRIMARY KEY (`icao`));"
-    )
-    .unwrap();
-    writeln!(
-        sql_out,
-        "CREATE TABLE IF NOT EXISTS `chart` (
-            `id` INT NOT NULL AUTO_INCREMENT,
-            `airport_icao` CHAR(4) NOT NULL,
-            `title` VARCHAR(128) NOT NULL,
-            `url` TEXT NOT NULL,
-            PRIMARY KEY (`id`),
-            INDEX `fk_chart_airport_idx` (`airport_icao` ASC) VISIBLE,
-            CONSTRAINT `fk_chart_airport`
-              FOREIGN KEY (`airport_icao`)
-              REFERENCES `airport` (`icao`)
-              ON DELETE CASCADE
-              ON UPDATE CASCADE);"
-    )
-    .unwrap();
+    pb_eaip.set_message("Fetching airport list... ");
+    let mut airports = Airports::from_eaip(eaip, airac.clone()).await.unwrap();
+    pb_eaip.inc(1);
 
+    pb_eaip.set_message("Fetching airport details... ");
+    let pb_airports = m.insert_after(&pb_eaip, ProgressBar::new(airports.len() as u64));
+    pb_airports.set_style(sty.clone());
+    for airport in &mut airports {
+        let icao = airport.icao().clone();
+        pb_airports.set_message(format!("Fetching airport {}... ", icao));
+        *airport = Airport::from_eaip(eaip, airac.clone(), icao).await.unwrap();
+        pb_airports.inc(1);
+    }
+    pb_eaip.inc(1);
+    pb_eaip.set_message("Storing airports... ");
     for airport in airports {
-        writeln!(
-            sql_out,
-            r#"INSERT INTO `airport` VALUES ("{}", "{}", {}, {}, {});"#,
-            airport.icao(),
-            airport.name(),
-            airport.longitude(),
-            airport.latitude(),
-            airport.elevation(),
+        pb_eaip.set_message(format!("Storing airport {}... ", airport.icao()));
+        sqlx::query(
+            "INSERT INTO `airport` (`icao`, `name`, `latitude`, `longitude`, `elevation`) VALUES (?, ?, ?, ?, ?);",
         )
-        .unwrap();
-        for chart in airport.charts() {
-            writeln!(
-                sql_out,
-                r#"INSERT INTO `chart` (`airport_icao`, `title`, `url`) VALUES ("{}", "{}", "{}");"#,
-                airport.icao(),
-                chart.title(),
-                chart.url(),
+        .bind(airport.icao())
+        .bind(airport.name())
+        .bind(airport.latitude())
+        .bind(airport.longitude())
+        .bind(airport.elevation() as i32)
+        .execute(pool)
+        .await
+        .with_context(|| {
+            format!(
+                "Inserting airport {} to the database.",
+                airport.icao()
             )
-            .unwrap();
+        })?;
+
+        let mut i = 1i32;
+        for chart in airport.charts() {
+            sqlx::query(
+                "INSERT INTO `chart` (`airport_icao`, `chart_id`, `title`, `url`) VALUES (?, ?, ?, ?);",
+            )
+            .bind(airport.icao())
+            .bind(i)
+            .bind(chart.title())
+            .bind(chart.url())
+            .execute(pool)
+            .await
+            .with_context(|| {
+                format!(
+                    "Inserting airport {} chart {} to the database.",
+                    airport.icao(),
+                    chart.title(),
+                )
+            })?;
+            i += 1;
+        }
+    }
+    pb_eaip.inc(1);
+
+    m.remove(&pb_airports);
+    Ok(())
+}
+
+async fn add_metadata_property<S: Into<String>>(pool: &AnyPool, key: S, value: S) -> Result<()> {
+    let key = key.into();
+
+    sqlx::query("INSERT INTO `properties` (`id`, `value`) VALUES (?, ?);")
+        .bind(key.clone())
+        .bind(value.into())
+        .execute(pool)
+        .await
+        .with_context(|| format!("Failed to insert property {}. Maybe this database has already had navdata generated?", key))?;
+
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args = Args::parse();
+
+    if args.list_ais {
+        println!("Available AISs:");
+        for s in &*ais::ALL {
+            println!("  {}: {}", s.country(), s.name());
+        }
+        std::process::exit(0);
+    }
+
+    let pool = AnyPool::connect(&args.database_uri)
+        .await
+        .with_context(|| "Failed to connect to database!")?;
+
+    // Preparing database
+    sqlx::query(include_str!("schema.sql"))
+        .execute(&pool)
+        .await
+        .with_context(|| "Failed to prepare database schema.")?;
+
+    let mut airac = AIRAC::current();
+    if args.next_cycle {
+        airac = airac.next();
+    }
+
+    // Add metadata to properties table
+    add_metadata_property(&pool, "generator", "eaip2sql").await?;
+    add_metadata_property(&pool, "valid_from", &airac.starts().to_string()).await?;
+    add_metadata_property(&pool, "valid_until", &airac.ends().to_string()).await?;
+    add_metadata_property(&pool, "generated_at", &Utc::now().to_string()).await?;
+
+    let mut eaips = Vec::new();
+    for eaip in &*ais::ALL {
+        if !args.exclude_ais.contains(&eaip.country().to_string()) {
+            eaips.push(eaip);
         }
     }
 
-    eprintln!("done!");
+    let m = Arc::new(MultiProgress::new());
+    let sty = ProgressStyle::with_template(
+        "[{elapsed_precise}] [{bar:40.cyan/blue}] {pos:>7}/{len:7} {msg}",
+    )
+    .unwrap()
+    .progress_chars("=> ");
+
+    let pb = m.add(ProgressBar::new(eaips.len() as u64));
+    pb.set_style(sty.clone());
+
+    let pb_eaip = m.insert_after(&pb, ProgressBar::new(9));
+    pb_eaip.set_style(sty.clone());
+
+    let m_c = m.clone();
+    let worker = tokio::spawn(async move {
+        for eaip in eaips {
+            pb.set_message(format!("{} ({})", eaip.name(), eaip.country()));
+            let eaip = eaip.eaip();
+            get_eaip_data(&m_c, &pb_eaip, sty.clone(), eaip, airac.clone(), &pool)
+                .await
+                .unwrap();
+        }
+    });
+
+    let _ = worker
+        .await
+        .with_context(|| "Failed to process eAIP data.")?;
+    m.clear().unwrap();
+
+    Ok(())
 }
