@@ -50,7 +50,7 @@ async fn get_eaip_data(
         already_inserted.push(navaid.id().clone());
 
         pb_eaip.set_message(format!("Storing navaid {}... ", navaid.id()));
-        sqlx::query("INSERT INTO `navaid` (`id`, `name`, `frequency`, `latitude`, `longitude`, `elevation`, `type`) VALUES (?, ?, ?, ?, ?, ?, ?);")
+        sqlx::query("INSERT INTO `navaid` (`designator`, `name`, `frequency`, `latitude`, `longitude`, `elevation`, `type`) VALUES (?, ?, ?, ?, ?, ?, ?);")
             .bind(navaid.id())
             .bind(navaid.name())
             .bind(if navaid.kind() == NavAidKind::NDB { navaid.frequency_khz() as f32 } else { navaid.frequency() })
@@ -62,6 +62,7 @@ async fn get_eaip_data(
                 NavAidKind::DME => "DME",
                 NavAidKind::NDB => "NDB",
                 NavAidKind::VORDME => "VOR,DME",
+                NavAidKind::TACAN => "TACAN",
             })
             .execute(pool)
             .await
@@ -96,10 +97,10 @@ async fn get_eaip_data(
     pb_eaip.inc(1);
 
     pb_eaip.set_message("Fetching airways... ");
-    let airways = Airways::from_eaip(eaip, airac.clone()).await.unwrap();
+    //let airways = Airways::from_eaip(eaip, airac.clone()).await.unwrap();
     pb_eaip.inc(1);
     pb_eaip.set_message("Storing airways... ");
-    for airway in airways {
+    /*for airway in airways {
         let mut i = 1;
         pb_eaip.set_message(format!("Storing {} airway... ", airway.designator()));
         for waypoint in airway.waypoints() {
@@ -123,7 +124,7 @@ async fn get_eaip_data(
             })?;
             i += 1;
         }
-    }
+    }*/
     pb_eaip.inc(1);
 
     pb_eaip.set_message("Fetching airport list... ");
